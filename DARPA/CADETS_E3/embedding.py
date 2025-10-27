@@ -70,15 +70,52 @@ def _hash_token(token):
     return (int(digest, 16) % (context_vocab_size - 1)) + 1 if context_vocab_size > 1 else 0
 
 
-def _build_context_tensors(nodeid2msg, node_idx):
-    context = nodeid2msg.get(node_idx, {})
-    parts = []
-    if isinstance(context, dict) and context:
-        for key, value in context.items():
-            parts.append(key)
-            parts.append(value)
-    elif context is not None:
-        parts.append(context)
+CMD_CONTEXT_KEYS = (
+    "cmd",
+    "command",
+    "argv",
+    "arg",
+    "subject",
+    "process",
+    "exe",
+)
+
+PATH_CONTEXT_KEYS = (
+    "file",
+    "path",
+    "netflow",
+    "directory",
+    "dir",
+    "ip",
+)
+
+
+def _separate_context_parts(node_context):
+    cmd_parts = []
+    path_parts = []
+
+    if isinstance(node_context, dict):
+        for key, value in node_context.items():
+            if value is None:
+                continue
+            key_lower = str(key).lower()
+            value_str = value if isinstance(value, str) else str(value)
+            if any(tag in key_lower for tag in CMD_CONTEXT_KEYS):
+                cmd_parts.append(value_str)
+            if any(tag in key_lower for tag in PATH_CONTEXT_KEYS):
+                path_parts.append(value_str)
+        if not cmd_parts and not path_parts and node_context:
+            fallback = " ".join(str(v) for v in node_context.values() if v)
+            if fallback:
+                cmd_parts.append(fallback)
+    elif node_context is not None:
+        value_str = node_context if isinstance(node_context, str) else str(node_context)
+        cmd_parts.append(value_str)
+
+    return cmd_parts, path_parts
+
+
+def _build_context_tensors(parts):
     tokens = _tokenize_context(parts)
 
     token_tensor = torch.zeros(context_max_seq_len, dtype=torch.long)
@@ -160,10 +197,14 @@ def gen_vectorized_graphs(cur, node2higvec, rel2vec, nodeid2msg, logger):
         dst = []
         msg = []
         t = []
-        src_context_tokens = []
-        src_context_mask = []
-        dst_context_tokens = []
-        dst_context_mask = []
+        src_cmd_tokens = []
+        src_cmd_mask = []
+        src_path_tokens = []
+        src_path_mask = []
+        dst_cmd_tokens = []
+        dst_cmd_mask = []
+        dst_path_tokens = []
+        dst_path_mask = []
 
         for i in edge_list:
             src_idx = int(i[0])
@@ -174,14 +215,35 @@ def gen_vectorized_graphs(cur, node2higvec, rel2vec, nodeid2msg, logger):
                 torch.cat([torch.from_numpy(node2higvec[src_idx]), rel2vec[i[2]], torch.from_numpy(node2higvec[dst_idx])]))
             t.append(int(i[3]))
 
-            src_tokens, src_mask = _build_context_tensors(nodeid2msg, src_idx)
-            dst_tokens, dst_mask = _build_context_tensors(nodeid2msg, dst_idx)
-            src_context_tokens.append(src_tokens)
-            src_context_mask.append(src_mask)
-            dst_context_tokens.append(dst_tokens)
-            dst_context_mask.append(dst_mask)
+            src_context = nodeid2msg.get(src_idx, {})
+            dst_context = nodeid2msg.get(dst_idx, {})
 
-        if not (len(src) == len(dst) == len(t) == len(src_context_tokens) == len(dst_context_tokens)):
+            src_cmd_parts, src_path_parts = _separate_context_parts(src_context)
+            dst_cmd_parts, dst_path_parts = _separate_context_parts(dst_context)
+
+            src_cmd_tensor, src_cmd_mask_tensor = _build_context_tensors(src_cmd_parts)
+            src_path_tensor, src_path_mask_tensor = _build_context_tensors(src_path_parts)
+            dst_cmd_tensor, dst_cmd_mask_tensor = _build_context_tensors(dst_cmd_parts)
+            dst_path_tensor, dst_path_mask_tensor = _build_context_tensors(dst_path_parts)
+
+            src_cmd_tokens.append(src_cmd_tensor)
+            src_cmd_mask.append(src_cmd_mask_tensor)
+            src_path_tokens.append(src_path_tensor)
+            src_path_mask.append(src_path_mask_tensor)
+            dst_cmd_tokens.append(dst_cmd_tensor)
+            dst_cmd_mask.append(dst_cmd_mask_tensor)
+            dst_path_tokens.append(dst_path_tensor)
+            dst_path_mask.append(dst_path_mask_tensor)
+
+        if not (
+            len(src)
+            == len(dst)
+            == len(t)
+            == len(src_cmd_tokens)
+            == len(dst_cmd_tokens)
+            == len(src_path_tokens)
+            == len(dst_path_tokens)
+        ):
             raise RuntimeError(
                 "Temporal feature alignment failed: mismatched lengths between structural and context sequences"
             )
@@ -198,19 +260,27 @@ def gen_vectorized_graphs(cur, node2higvec, rel2vec, nodeid2msg, logger):
         dataset.dst = torch.tensor(dst)
         dataset.t = t_tensor
         dataset.msg = torch.vstack(msg)
-        dataset.src_context_tokens = torch.stack(src_context_tokens)
-        dataset.src_context_mask = torch.stack(src_context_mask)
-        dataset.dst_context_tokens = torch.stack(dst_context_tokens)
-        dataset.dst_context_mask = torch.stack(dst_context_mask)
+        dataset.src_cmd_tokens = torch.stack(src_cmd_tokens)
+        dataset.src_cmd_mask = torch.stack(src_cmd_mask)
+        dataset.src_path_tokens = torch.stack(src_path_tokens)
+        dataset.src_path_mask = torch.stack(src_path_mask)
+        dataset.dst_cmd_tokens = torch.stack(dst_cmd_tokens)
+        dataset.dst_cmd_mask = torch.stack(dst_cmd_mask)
+        dataset.dst_path_tokens = torch.stack(dst_path_tokens)
+        dataset.dst_path_mask = torch.stack(dst_path_mask)
         dataset.context_event_index = torch.arange(dataset.t.numel(), dtype=torch.long)
         dataset.src = dataset.src.to(torch.long)
         dataset.dst = dataset.dst.to(torch.long)
         dataset.msg = dataset.msg.to(torch.float)
         dataset.t = dataset.t.to(torch.long)
-        dataset.src_context_tokens = dataset.src_context_tokens.to(torch.long)
-        dataset.dst_context_tokens = dataset.dst_context_tokens.to(torch.long)
-        dataset.src_context_mask = dataset.src_context_mask.to(torch.bool)
-        dataset.dst_context_mask = dataset.dst_context_mask.to(torch.bool)
+        dataset.src_cmd_tokens = dataset.src_cmd_tokens.to(torch.long)
+        dataset.src_path_tokens = dataset.src_path_tokens.to(torch.long)
+        dataset.dst_cmd_tokens = dataset.dst_cmd_tokens.to(torch.long)
+        dataset.dst_path_tokens = dataset.dst_path_tokens.to(torch.long)
+        dataset.src_cmd_mask = dataset.src_cmd_mask.to(torch.bool)
+        dataset.src_path_mask = dataset.src_path_mask.to(torch.bool)
+        dataset.dst_cmd_mask = dataset.dst_cmd_mask.to(torch.bool)
+        dataset.dst_path_mask = dataset.dst_path_mask.to(torch.bool)
         dataset.context_event_index = dataset.context_event_index.to(torch.long)
         torch.save(dataset, graphs_dir + "/graph_4_" + str(day) + ".TemporalData.simple")
 
