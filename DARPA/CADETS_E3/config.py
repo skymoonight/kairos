@@ -101,6 +101,12 @@ rel2id = {
 # Node Embedding Dimension
 node_embedding_dim = 16
 
+# Maximum number of context tokens stored per event for sequence features
+context_max_seq_len = 32
+
+# Size of the hashed vocabulary used for command/path tokens (0 is reserved for padding)
+context_vocab_size = 4096
+
 # Node State Dimension
 node_state_dim = 100
 
