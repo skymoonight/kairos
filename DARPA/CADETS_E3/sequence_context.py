@@ -23,14 +23,10 @@ from typing import Iterable, Optional
 import torch
 
 REQUIRED_SEQUENCE_FIELDS = (
-    "src_cmd_tokens",
-    "src_cmd_mask",
-    "src_path_tokens",
-    "src_path_mask",
-    "dst_cmd_tokens",
-    "dst_cmd_mask",
-    "dst_path_tokens",
-    "dst_path_mask",
+    "cmd_tokens",
+    "cmd_mask",
+    "path_tokens",
+    "path_mask",
 )
 
 
@@ -49,28 +45,20 @@ class SequenceContextBatch:
     debugging/traceability.
     """
 
-    src_cmd_tokens: torch.Tensor
-    src_cmd_mask: torch.Tensor
-    src_path_tokens: torch.Tensor
-    src_path_mask: torch.Tensor
-    dst_cmd_tokens: torch.Tensor
-    dst_cmd_mask: torch.Tensor
-    dst_path_tokens: torch.Tensor
-    dst_path_mask: torch.Tensor
+    cmd_tokens: torch.Tensor
+    cmd_mask: torch.Tensor
+    path_tokens: torch.Tensor
+    path_mask: torch.Tensor
     event_index: Optional[torch.Tensor] = None
 
     def to(self, device: torch.device) -> "SequenceContextBatch":
         """Move all tensors to ``device`` and return a new instance."""
 
         return SequenceContextBatch(
-            src_cmd_tokens=self.src_cmd_tokens.to(device=device),
-            src_cmd_mask=self.src_cmd_mask.to(device=device),
-            src_path_tokens=self.src_path_tokens.to(device=device),
-            src_path_mask=self.src_path_mask.to(device=device),
-            dst_cmd_tokens=self.dst_cmd_tokens.to(device=device),
-            dst_cmd_mask=self.dst_cmd_mask.to(device=device),
-            dst_path_tokens=self.dst_path_tokens.to(device=device),
-            dst_path_mask=self.dst_path_mask.to(device=device),
+            cmd_tokens=self.cmd_tokens.to(device=device),
+            cmd_mask=self.cmd_mask.to(device=device),
+            path_tokens=self.path_tokens.to(device=device),
+            path_mask=self.path_mask.to(device=device),
             event_index=None if self.event_index is None else self.event_index.to(device=device),
         )
 
@@ -83,14 +71,10 @@ class SequenceContextBatch:
         """
 
         tensors: Iterable[torch.Tensor] = (
-            self.src_cmd_tokens,
-            self.src_cmd_mask,
-            self.src_path_tokens,
-            self.src_path_mask,
-            self.dst_cmd_tokens,
-            self.dst_cmd_mask,
-            self.dst_path_tokens,
-            self.dst_path_mask,
+            self.cmd_tokens,
+            self.cmd_mask,
+            self.path_tokens,
+            self.path_mask,
         )
 
         for tensor in tensors:
@@ -109,12 +93,7 @@ class SequenceContextBatch:
     def has_observed_tokens(self) -> bool:
         """Return ``True`` if any context token/mask contains real data."""
 
-        return bool(
-            self.src_cmd_mask.any()
-            or self.dst_cmd_mask.any()
-            or self.src_path_mask.any()
-            or self.dst_path_mask.any()
-        )
+        return bool(self.cmd_mask.any() or self.path_mask.any())
 
 
 def sequence_context_from_batch(batch) -> Optional[SequenceContextBatch]:
@@ -129,14 +108,10 @@ def sequence_context_from_batch(batch) -> Optional[SequenceContextBatch]:
         return None
 
     return SequenceContextBatch(
-        src_cmd_tokens=batch.src_cmd_tokens,
-        src_cmd_mask=batch.src_cmd_mask,
-        src_path_tokens=batch.src_path_tokens,
-        src_path_mask=batch.src_path_mask,
-        dst_cmd_tokens=batch.dst_cmd_tokens,
-        dst_cmd_mask=batch.dst_cmd_mask,
-        dst_path_tokens=batch.dst_path_tokens,
-        dst_path_mask=batch.dst_path_mask,
+        cmd_tokens=batch.cmd_tokens,
+        cmd_mask=batch.cmd_mask,
+        path_tokens=batch.path_tokens,
+        path_mask=batch.path_mask,
         event_index=getattr(batch, "context_event_index", None),
     )
 

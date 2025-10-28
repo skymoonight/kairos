@@ -2,6 +2,7 @@ from sklearn.feature_extraction import FeatureHasher
 from torch_geometric.data import *
 from tqdm import tqdm
 
+from collections import defaultdict, deque
 import hashlib
 import numpy as np
 import logging
@@ -50,19 +51,17 @@ def list2str(l):
 TOKEN_SPLIT_PATTERN = re.compile(r"[^A-Za-z0-9]+")
 
 
-def _tokenize_context(parts):
-    tokens = []
-    for part in parts:
-        if part is None:
-            continue
-        if not isinstance(part, str):
-            part = str(part)
-        for token in TOKEN_SPLIT_PATTERN.split(part):
-            if token:
-                tokens.append(token.lower())
-    if not tokens:
-        tokens.append("<unk>")
-    return tokens
+def _tokenize_context(text):
+    """Tokenize raw context text into a normalized token list."""
+
+    if not text or text in {"<no_cmd>", "<no_file>", "<unknown>"}:
+        return ["<unk>"]
+
+    if not isinstance(text, str):
+        text = str(text)
+
+    tokens = [token.lower() for token in TOKEN_SPLIT_PATTERN.split(text) if token]
+    return tokens or ["<unk>"]
 
 
 def _hash_token(token):
@@ -70,53 +69,10 @@ def _hash_token(token):
     return (int(digest, 16) % (context_vocab_size - 1)) + 1 if context_vocab_size > 1 else 0
 
 
-CMD_CONTEXT_KEYS = (
-    "cmd",
-    "command",
-    "argv",
-    "arg",
-    "subject",
-    "process",
-    "exe",
-)
+def _build_context_tensors(context_text):
+    """Turn raw context text into fixed-length token/mask tensors."""
 
-PATH_CONTEXT_KEYS = (
-    "file",
-    "path",
-    "netflow",
-    "directory",
-    "dir",
-    "ip",
-)
-
-
-def _separate_context_parts(node_context):
-    cmd_parts = []
-    path_parts = []
-
-    if isinstance(node_context, dict):
-        for key, value in node_context.items():
-            if value is None:
-                continue
-            key_lower = str(key).lower()
-            value_str = value if isinstance(value, str) else str(value)
-            if any(tag in key_lower for tag in CMD_CONTEXT_KEYS):
-                cmd_parts.append(value_str)
-            if any(tag in key_lower for tag in PATH_CONTEXT_KEYS):
-                path_parts.append(value_str)
-        if not cmd_parts and not path_parts and node_context:
-            fallback = " ".join(str(v) for v in node_context.values() if v)
-            if fallback:
-                cmd_parts.append(fallback)
-    elif node_context is not None:
-        value_str = node_context if isinstance(node_context, str) else str(node_context)
-        cmd_parts.append(value_str)
-
-    return cmd_parts, path_parts
-
-
-def _build_context_tensors(parts):
-    tokens = _tokenize_context(parts)
+    tokens = _tokenize_context(context_text)
 
     token_tensor = torch.zeros(context_max_seq_len, dtype=torch.long)
     mask_tensor = torch.zeros(context_max_seq_len, dtype=torch.bool)
@@ -128,10 +84,77 @@ def _build_context_tensors(parts):
     return token_tensor, mask_tensor
 
 
-def gen_feature(cur, nodeid2msg=None):
+def _extract_event_context(log_line):
+    """Extract command line and file/path hints from a raw log line."""
+
+    cmd_context = ""
+    file_context = ""
+
+    try:
+        cmd_match = re.search(r'"cmdLine":"([^"\\]*(?:\\.[^"\\]*)*)"', log_line)
+        if cmd_match:
+            cmd_context = bytes(cmd_match.group(1), "utf-8").decode("unicode_escape")
+        else:
+            exec_match = re.search(r'"exec":"([^"\\]*(?:\\.[^"\\]*)*)"', log_line)
+            if exec_match:
+                cmd_context = bytes(exec_match.group(1), "utf-8").decode("unicode_escape")
+
+        path_match = re.search(r'"predicateObjectPath"\s*:\s*\{"string":"([^"\\]*(?:\\.[^"\\]*)*)"\}', log_line)
+        if path_match:
+            file_context = bytes(path_match.group(1), "utf-8").decode("unicode_escape")
+    except Exception:
+        pass
+
+    return cmd_context or "<no_cmd>", file_context or "<no_file>"
+
+
+def _load_daily_context_map(day):
+    """Build a timestamp->context map for events in the given day."""
+
+    try:
+        raw_files = sorted(os.listdir(raw_dir))
+    except FileNotFoundError:
+        logger.warning(
+            "Raw log directory %s was not found; sequence context will default to placeholders.",
+            raw_dir,
+        )
+        return defaultdict(deque)
+
+    start_timestamp = datetime_to_ns_time_US(f"2018-04-{day} 00:00:00")
+    end_timestamp = datetime_to_ns_time_US(f"2018-04-{day + 1} 00:00:00")
+
+    context_map: defaultdict[int, deque] = defaultdict(deque)
+
+    for filename in raw_files:
+        filepath = os.path.join(raw_dir, filename)
+        if not os.path.isfile(filepath):
+            continue
+
+        try:
+            with open(filepath, "r") as handle:
+                for line in handle:
+                    if '"com.bbn.tc.schema.avro.cdm18.Event"' not in line:
+                        continue
+
+                    timestamp_match = re.search(r'"timestampNanos":\s*(\d+)', line)
+                    if not timestamp_match:
+                        continue
+
+                    timestamp = int(timestamp_match.group(1))
+                    if not (start_timestamp <= timestamp < end_timestamp):
+                        continue
+
+                    cmd_context, file_context = _extract_event_context(line)
+                    context_map[timestamp].append((cmd_context, file_context))
+        except (OSError, IOError):
+            logger.warning("Failed to read raw log file %s; skipping.", filepath)
+
+    return context_map
+
+
+def gen_feature(cur):
     # Firstly obtain all node labels
-    if nodeid2msg is None:
-        nodeid2msg = gen_nodeid2msg(cur=cur)
+    nodeid2msg = gen_nodeid2msg(cur=cur)
 
     # Construct the hierarchical representation for each node label
     node_msg_dic_list = []
@@ -170,42 +193,28 @@ def gen_relation_onehot():
     torch.save(rel2vec, artifact_dir + "rel2vec")
     return rel2vec
 
-def _context_record_to_mapping(node_type, node_msg):
-    """Build a lightweight mapping the tokenizer understands from SQL rows."""
-    if node_type is None and node_msg is None:
-        return {}
-
-    key = str(node_type).lower() if node_type is not None else "context"
-    value = node_msg if node_msg is not None else ""
-    return {key: value}
-
-
 def gen_vectorized_graphs(cur, node2higvec, rel2vec, logger):
     for day in tqdm(range(2, 14)):
+        logger.info(f'Processing day 2018-04-{day}')
+
+        logger.info(f'Loading context map for day {day}')
+        context_map = _load_daily_context_map(day)
+        logger.info(f'Loaded context for {sum(len(v) for v in context_map.values())} events on day {day}')
+
         start_timestamp = datetime_to_ns_time_US('2018-04-' + str(day) + ' 00:00:00')
         end_timestamp = datetime_to_ns_time_US('2018-04-' + str(day + 1) + ' 00:00:00')
         sql = """
-        SELECT
-            e.src_index_id::bigint AS src_index_id,
-            e.dst_index_id::bigint AS dst_index_id,
-            e.operation,
-            e.timestamp_rec,
-            src_meta.node_type   AS src_type,
-            src_meta.msg         AS src_msg,
-            dst_meta.node_type   AS dst_type,
-            dst_meta.msg         AS dst_msg
-        FROM event_table e
-        JOIN node2id src_meta ON src_meta.index_id = e.src_index_id::bigint
-        JOIN node2id dst_meta ON dst_meta.index_id = e.dst_index_id::bigint
-        WHERE e.timestamp_rec > '%s' AND e.timestamp_rec < '%s'
-        ORDER BY e.timestamp_rec;
+        select * from event_table
+        where
+              timestamp_rec>'%s' and timestamp_rec<'%s'
+               ORDER BY timestamp_rec;
         """ % (start_timestamp, end_timestamp)
         cur.execute(sql)
         events = cur.fetchall()
         logger.info(f'2018-04-{day}, events count: {len(events)}')
         edge_list = []
         for e in events:
-            edge_temp = [int(e[0]), int(e[1]), e[2], e[3], e[4], e[5], e[6], e[7]]
+            edge_temp = [int(e[1]), int(e[4]), e[2], e[5]]
             if e[2] in include_edge_type:
                 edge_list.append(edge_temp)
         logger.info(f'2018-04-{day}, edge list len: {len(edge_list)}')
@@ -217,14 +226,10 @@ def gen_vectorized_graphs(cur, node2higvec, rel2vec, logger):
         dst = []
         msg = []
         t = []
-        src_cmd_tokens = []
-        src_cmd_mask = []
-        src_path_tokens = []
-        src_path_mask = []
-        dst_cmd_tokens = []
-        dst_cmd_mask = []
-        dst_path_tokens = []
-        dst_path_mask = []
+        cmd_tokens = []
+        cmd_mask = []
+        path_tokens = []
+        path_mask = []
 
         for i in edge_list:
             src_idx = int(i[0])
@@ -235,34 +240,27 @@ def gen_vectorized_graphs(cur, node2higvec, rel2vec, logger):
                 torch.cat([torch.from_numpy(node2higvec[src_idx]), rel2vec[i[2]], torch.from_numpy(node2higvec[dst_idx])]))
             t.append(int(i[3]))
 
-            src_context = _context_record_to_mapping(i[4], i[5])
-            dst_context = _context_record_to_mapping(i[6], i[7])
+            cmd_context, path_context = "<no_cmd>", "<no_file>"
+            timestamp = int(i[3])
+            if timestamp in context_map and context_map[timestamp]:
+                cmd_context, path_context = context_map[timestamp].popleft()
+                if not context_map[timestamp]:
+                    del context_map[timestamp]
 
-            src_cmd_parts, src_path_parts = _separate_context_parts(src_context)
-            dst_cmd_parts, dst_path_parts = _separate_context_parts(dst_context)
+            cmd_tensor, cmd_mask_tensor = _build_context_tensors(cmd_context)
+            path_tensor, path_mask_tensor = _build_context_tensors(path_context)
 
-            src_cmd_tensor, src_cmd_mask_tensor = _build_context_tensors(src_cmd_parts)
-            src_path_tensor, src_path_mask_tensor = _build_context_tensors(src_path_parts)
-            dst_cmd_tensor, dst_cmd_mask_tensor = _build_context_tensors(dst_cmd_parts)
-            dst_path_tensor, dst_path_mask_tensor = _build_context_tensors(dst_path_parts)
-
-            src_cmd_tokens.append(src_cmd_tensor)
-            src_cmd_mask.append(src_cmd_mask_tensor)
-            src_path_tokens.append(src_path_tensor)
-            src_path_mask.append(src_path_mask_tensor)
-            dst_cmd_tokens.append(dst_cmd_tensor)
-            dst_cmd_mask.append(dst_cmd_mask_tensor)
-            dst_path_tokens.append(dst_path_tensor)
-            dst_path_mask.append(dst_path_mask_tensor)
+            cmd_tokens.append(cmd_tensor)
+            cmd_mask.append(cmd_mask_tensor)
+            path_tokens.append(path_tensor)
+            path_mask.append(path_mask_tensor)
 
         if not (
             len(src)
             == len(dst)
             == len(t)
-            == len(src_cmd_tokens)
-            == len(dst_cmd_tokens)
-            == len(src_path_tokens)
-            == len(dst_path_tokens)
+            == len(cmd_tokens)
+            == len(path_tokens)
         ):
             raise RuntimeError(
                 "Temporal feature alignment failed: mismatched lengths between structural and context sequences"
@@ -280,27 +278,19 @@ def gen_vectorized_graphs(cur, node2higvec, rel2vec, logger):
         dataset.dst = torch.tensor(dst)
         dataset.t = t_tensor
         dataset.msg = torch.vstack(msg)
-        dataset.src_cmd_tokens = torch.stack(src_cmd_tokens)
-        dataset.src_cmd_mask = torch.stack(src_cmd_mask)
-        dataset.src_path_tokens = torch.stack(src_path_tokens)
-        dataset.src_path_mask = torch.stack(src_path_mask)
-        dataset.dst_cmd_tokens = torch.stack(dst_cmd_tokens)
-        dataset.dst_cmd_mask = torch.stack(dst_cmd_mask)
-        dataset.dst_path_tokens = torch.stack(dst_path_tokens)
-        dataset.dst_path_mask = torch.stack(dst_path_mask)
+        dataset.cmd_tokens = torch.stack(cmd_tokens)
+        dataset.cmd_mask = torch.stack(cmd_mask)
+        dataset.path_tokens = torch.stack(path_tokens)
+        dataset.path_mask = torch.stack(path_mask)
         dataset.context_event_index = torch.arange(dataset.t.numel(), dtype=torch.long)
         dataset.src = dataset.src.to(torch.long)
         dataset.dst = dataset.dst.to(torch.long)
         dataset.msg = dataset.msg.to(torch.float)
         dataset.t = dataset.t.to(torch.long)
-        dataset.src_cmd_tokens = dataset.src_cmd_tokens.to(torch.long)
-        dataset.src_path_tokens = dataset.src_path_tokens.to(torch.long)
-        dataset.dst_cmd_tokens = dataset.dst_cmd_tokens.to(torch.long)
-        dataset.dst_path_tokens = dataset.dst_path_tokens.to(torch.long)
-        dataset.src_cmd_mask = dataset.src_cmd_mask.to(torch.bool)
-        dataset.src_path_mask = dataset.src_path_mask.to(torch.bool)
-        dataset.dst_cmd_mask = dataset.dst_cmd_mask.to(torch.bool)
-        dataset.dst_path_mask = dataset.dst_path_mask.to(torch.bool)
+        dataset.cmd_tokens = dataset.cmd_tokens.to(torch.long)
+        dataset.path_tokens = dataset.path_tokens.to(torch.long)
+        dataset.cmd_mask = dataset.cmd_mask.to(torch.bool)
+        dataset.path_mask = dataset.path_mask.to(torch.bool)
         dataset.context_event_index = dataset.context_event_index.to(torch.long)
         torch.save(dataset, graphs_dir + "/graph_4_" + str(day) + ".TemporalData.simple")
 
@@ -310,8 +300,7 @@ if __name__ == "__main__":
     os.system(f"mkdir -p {graphs_dir}")
 
     cur, _ = init_database_connection()
-    nodeid2msg = gen_nodeid2msg(cur=cur)
-    node2higvec = gen_feature(cur=cur, nodeid2msg=nodeid2msg)
+    node2higvec = gen_feature(cur=cur)
     rel2vec = gen_relation_onehot()
     gen_vectorized_graphs(cur=cur, node2higvec=node2higvec, rel2vec=rel2vec, logger=logger)
 
