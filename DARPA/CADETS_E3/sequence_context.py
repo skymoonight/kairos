@@ -95,6 +95,11 @@ class SequenceContextBatch:
 
         return bool(self.cmd_mask.any() or self.path_mask.any())
 
+    def event_mask(self) -> torch.Tensor:
+        """Return a boolean mask indicating events with observed tokens."""
+
+        return self.cmd_mask.any(dim=1) | self.path_mask.any(dim=1)
+
 
 def sequence_context_from_batch(batch) -> Optional[SequenceContextBatch]:
     """Extract :class:`SequenceContextBatch` from a ``TemporalData`` batch.
