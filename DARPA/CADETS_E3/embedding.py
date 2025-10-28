@@ -170,22 +170,42 @@ def gen_relation_onehot():
     torch.save(rel2vec, artifact_dir + "rel2vec")
     return rel2vec
 
-def gen_vectorized_graphs(cur, node2higvec, rel2vec, nodeid2msg, logger):
+def _context_record_to_mapping(node_type, node_msg):
+    """Build a lightweight mapping the tokenizer understands from SQL rows."""
+    if node_type is None and node_msg is None:
+        return {}
+
+    key = str(node_type).lower() if node_type is not None else "context"
+    value = node_msg if node_msg is not None else ""
+    return {key: value}
+
+
+def gen_vectorized_graphs(cur, node2higvec, rel2vec, logger):
     for day in tqdm(range(2, 14)):
         start_timestamp = datetime_to_ns_time_US('2018-04-' + str(day) + ' 00:00:00')
         end_timestamp = datetime_to_ns_time_US('2018-04-' + str(day + 1) + ' 00:00:00')
         sql = """
-        select * from event_table
-        where
-              timestamp_rec>'%s' and timestamp_rec<'%s'
-               ORDER BY timestamp_rec;
+        SELECT
+            e.src_index_id::bigint AS src_index_id,
+            e.dst_index_id::bigint AS dst_index_id,
+            e.operation,
+            e.timestamp_rec,
+            src_meta.node_type   AS src_type,
+            src_meta.msg         AS src_msg,
+            dst_meta.node_type   AS dst_type,
+            dst_meta.msg         AS dst_msg
+        FROM event_table e
+        JOIN node2id src_meta ON src_meta.index_id = e.src_index_id::bigint
+        JOIN node2id dst_meta ON dst_meta.index_id = e.dst_index_id::bigint
+        WHERE e.timestamp_rec > '%s' AND e.timestamp_rec < '%s'
+        ORDER BY e.timestamp_rec;
         """ % (start_timestamp, end_timestamp)
         cur.execute(sql)
         events = cur.fetchall()
         logger.info(f'2018-04-{day}, events count: {len(events)}')
         edge_list = []
         for e in events:
-            edge_temp = [int(e[1]), int(e[4]), e[2], e[5]]
+            edge_temp = [int(e[0]), int(e[1]), e[2], e[3], e[4], e[5], e[6], e[7]]
             if e[2] in include_edge_type:
                 edge_list.append(edge_temp)
         logger.info(f'2018-04-{day}, edge list len: {len(edge_list)}')
@@ -215,8 +235,8 @@ def gen_vectorized_graphs(cur, node2higvec, rel2vec, nodeid2msg, logger):
                 torch.cat([torch.from_numpy(node2higvec[src_idx]), rel2vec[i[2]], torch.from_numpy(node2higvec[dst_idx])]))
             t.append(int(i[3]))
 
-            src_context = nodeid2msg.get(src_idx, {})
-            dst_context = nodeid2msg.get(dst_idx, {})
+            src_context = _context_record_to_mapping(i[4], i[5])
+            dst_context = _context_record_to_mapping(i[6], i[7])
 
             src_cmd_parts, src_path_parts = _separate_context_parts(src_context)
             dst_cmd_parts, dst_path_parts = _separate_context_parts(dst_context)
@@ -293,5 +313,5 @@ if __name__ == "__main__":
     nodeid2msg = gen_nodeid2msg(cur=cur)
     node2higvec = gen_feature(cur=cur, nodeid2msg=nodeid2msg)
     rel2vec = gen_relation_onehot()
-    gen_vectorized_graphs(cur=cur, node2higvec=node2higvec, rel2vec=rel2vec, nodeid2msg=nodeid2msg, logger=logger)
+    gen_vectorized_graphs(cur=cur, node2higvec=node2higvec, rel2vec=rel2vec, logger=logger)
 
