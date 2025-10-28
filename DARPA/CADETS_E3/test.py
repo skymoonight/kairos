@@ -8,6 +8,11 @@ import logging
 from kairos_utils import *
 from config import *
 from model import *
+from sequence_context import (
+    sequence_context_available,
+    sequence_context_from_batch,
+)
+from sequence_encoder import SequenceBranchBundle
 
 # Setting for logging
 logger = logging.getLogger("reconstruction_logger")
@@ -26,8 +31,11 @@ def test(inference_data,
           link_pred,
           neighbor_loader,
           nodeid2msg,
-          path
+          path,
+          seq_branch: SequenceBranchBundle | None = None,
           ):
+    has_sequence_context = sequence_context_available(inference_data)
+
     if os.path.exists(path):
         pass
     else:
@@ -36,6 +44,10 @@ def test(inference_data,
     memory.eval()
     gnn.eval()
     link_pred.eval()
+    if seq_branch is not None and seq_branch.enabled:
+        seq_branch.encoder.eval()
+        seq_branch.classifier.eval()
+        seq_branch.fusion.eval()
 
     memory.reset_state()  # Start with a fresh memory.
     neighbor_loader.reset_state()  # Start with an empty graph.
@@ -58,6 +70,12 @@ def test(inference_data,
     for batch in inference_data.seq_batches(batch_size=BATCH):
 
         src, pos_dst, t, msg = batch.src, batch.dst, batch.t, batch.msg
+        seq_context = None
+        if has_sequence_context:
+            seq_context = sequence_context_from_batch(batch)
+            if seq_context is not None:
+                seq_context.validate(src.size(0))
+                seq_context = seq_context.to(device=device)
         unique_nodes = torch.cat([unique_nodes, src, pos_dst]).unique()
         total_edges += BATCH
 
@@ -68,10 +86,34 @@ def test(inference_data,
         z, last_update = memory(n_id)
         z = gnn(z, last_update, edge_index, inference_data.t[e_id], inference_data.msg[e_id])
 
-        pos_out = link_pred(z[assoc[src]], z[assoc[pos_dst]])
+        graph_logits = link_pred(z[assoc[src]], z[assoc[pos_dst]])
 
-        pos_o.append(pos_out)
-        y_pred = torch.cat([pos_out], dim=0)
+        seq_logits = None
+        context_mask = None
+        if seq_branch is not None and seq_context is not None and seq_branch.enabled:
+            context_mask = seq_context.event_mask()
+            if context_mask.any():
+                seq_repr, _, _ = seq_branch.encoder(
+                    seq_context.cmd_tokens,
+                    seq_context.cmd_mask,
+                    seq_context.path_tokens,
+                    seq_context.path_mask,
+                )
+                seq_logits = seq_branch.classifier(seq_repr)
+            else:
+                context_mask = None
+
+        fused_logits = graph_logits
+        fusion_gate = None
+        if seq_branch is not None and seq_logits is not None and seq_branch.enabled:
+            fused_logits, fusion_gate = seq_branch.fusion(
+                graph_logits,
+                seq_logits,
+                context_mask,
+            )
+
+        pos_o.append(fused_logits)
+        y_pred = fused_logits
         y_true = []
         for m in msg:
             l = tensor_find(m[node_embedding_dim:-node_embedding_dim], 1) - 1
@@ -87,9 +129,17 @@ def test(inference_data,
         neighbor_loader.insert(src, pos_dst)
 
         # compute the loss for each edge
-        each_edge_loss = cal_pos_edges_loss_multiclass(pos_out, y_true)
+        fusion_edge_loss = cal_pos_edges_loss_multiclass(fused_logits, y_true)
+        graph_edge_loss = cal_pos_edges_loss_multiclass(graph_logits, y_true)
+        seq_edge_loss = None
+        if seq_logits is not None:
+            seq_edge_loss = cal_pos_edges_loss_multiclass(seq_logits, y_true)
 
-        for i in range(len(pos_out)):
+        avg_gate = None
+        if fusion_gate is not None:
+            avg_gate = fusion_gate.mean(dim=1)
+
+        for i in range(len(fused_logits)):
             srcnode = int(src[i])
             dstnode = int(pos_dst[i])
 
@@ -98,10 +148,15 @@ def test(inference_data,
             t_var = int(t[i])
             edgeindex = tensor_find(msg[i][node_embedding_dim:-node_embedding_dim], 1)
             edge_type = rel2id[edgeindex]
-            loss = each_edge_loss[i]
+            edge_loss = fusion_edge_loss[i]
 
             temp_dic = {}
-            temp_dic['loss'] = float(loss)
+            temp_dic['loss'] = float(edge_loss)
+            temp_dic['graph_loss'] = float(graph_edge_loss[i])
+            if seq_edge_loss is not None:
+                temp_dic['sequence_loss'] = float(seq_edge_loss[i])
+            if avg_gate is not None:
+                temp_dic['fusion_gate'] = float(avg_gate[i])
             temp_dic['srcnode'] = srcnode
             temp_dic['dstnode'] = dstnode
             temp_dic['srcmsg'] = srcmsg
@@ -166,8 +221,27 @@ if __name__ == "__main__":
     # Load data
     graph_4_3, graph_4_4, graph_4_5, graph_4_6, graph_4_7 = load_data()
 
+    has_context = all(sequence_context_available(graph) for graph in (graph_4_3, graph_4_4, graph_4_5, graph_4_6, graph_4_7))
+    if not has_context:
+        logger.warning(
+            "Sequence context tensors were missing from at least one inference graph. "
+            "Sequence branch scores will be skipped for those batches."
+        )
+
     # load trained model
-    memory, gnn, link_pred, neighbor_loader = torch.load(f"{models_dir}/models.pt",map_location=device)
+    loaded = torch.load(f"{models_dir}/models.pt", map_location=device)
+    seq_branch = None
+    if isinstance(loaded, (list, tuple)) and len(loaded) >= 7:
+        memory, gnn, link_pred, neighbor_loader, seq_encoder, seq_classifier, seq_fusion = loaded
+        seq_branch = SequenceBranchBundle(
+            encoder=seq_encoder,
+            classifier=seq_classifier,
+            fusion=seq_fusion,
+        ).to(device=device)
+    elif isinstance(loaded, (list, tuple)) and len(loaded) == 4:
+        memory, gnn, link_pred, neighbor_loader = loaded
+    else:
+        raise RuntimeError("Unexpected model checkpoint format; cannot restore modules.")
 
     # Reconstruct the edges in each day
     test(inference_data=graph_4_3,
@@ -176,7 +250,8 @@ if __name__ == "__main__":
          link_pred=link_pred,
          neighbor_loader=neighbor_loader,
          nodeid2msg=nodeid2msg,
-         path=artifact_dir + "graph_4_3")
+         path=artifact_dir + "graph_4_3",
+         seq_branch=seq_branch)
 
     test(inference_data=graph_4_4,
          memory=memory,
@@ -184,7 +259,8 @@ if __name__ == "__main__":
          link_pred=link_pred,
          neighbor_loader=neighbor_loader,
          nodeid2msg=nodeid2msg,
-         path=artifact_dir + "graph_4_4")
+         path=artifact_dir + "graph_4_4",
+         seq_branch=seq_branch)
 
     test(inference_data=graph_4_5,
          memory=memory,
@@ -192,7 +268,8 @@ if __name__ == "__main__":
          link_pred=link_pred,
          neighbor_loader=neighbor_loader,
          nodeid2msg=nodeid2msg,
-         path=artifact_dir + "graph_4_5")
+         path=artifact_dir + "graph_4_5",
+         seq_branch=seq_branch)
 
     test(inference_data=graph_4_6,
          memory=memory,
@@ -200,7 +277,8 @@ if __name__ == "__main__":
          link_pred=link_pred,
          neighbor_loader=neighbor_loader,
          nodeid2msg=nodeid2msg,
-         path=artifact_dir + "graph_4_6")
+         path=artifact_dir + "graph_4_6",
+         seq_branch=seq_branch)
 
     test(inference_data=graph_4_7,
          memory=memory,
@@ -208,4 +286,5 @@ if __name__ == "__main__":
          link_pred=link_pred,
          neighbor_loader=neighbor_loader,
          nodeid2msg=nodeid2msg,
-         path=artifact_dir + "graph_4_7")
+         path=artifact_dir + "graph_4_7",
+         seq_branch=seq_branch)

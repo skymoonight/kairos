@@ -101,6 +101,32 @@ rel2id = {
 # Node Embedding Dimension
 node_embedding_dim = 16
 
+# Maximum number of context tokens stored per event for sequence features
+context_max_seq_len = 32
+
+# Size of the hashed vocabulary used for command/path tokens (0 is reserved for padding)
+context_vocab_size = 4096
+
+# Whether to enable the auxiliary sequence branch and consensus fusion head
+enable_sequence_branch = True
+
+# Transformer-style encoder dimensions for command/path sequences
+seq_embedding_dim = 64
+seq_hidden_dim = 128
+seq_num_heads = 4
+seq_num_layers = 2
+seq_feedforward_dim = 256
+seq_dropout = 0.1
+
+# Fusion head hyper-parameters
+fusion_hidden_dim = 128
+fusion_dropout = 0.1
+
+# Training behaviour for the multimodal setup
+sequence_warmup_epochs = 3
+sequence_aux_loss_weight = 0.1
+graph_aux_loss_weight = 0.0
+
 # Node State Dimension
 node_state_dim = 100
 
