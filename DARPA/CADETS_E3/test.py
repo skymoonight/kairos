@@ -8,6 +8,10 @@ import logging
 from kairos_utils import *
 from config import *
 from model import *
+from sequence_context import (
+    sequence_context_available,
+    sequence_context_from_batch,
+)
 
 # Setting for logging
 logger = logging.getLogger("reconstruction_logger")
@@ -28,6 +32,8 @@ def test(inference_data,
           nodeid2msg,
           path
           ):
+    has_sequence_context = sequence_context_available(inference_data)
+
     if os.path.exists(path):
         pass
     else:
@@ -58,6 +64,10 @@ def test(inference_data,
     for batch in inference_data.seq_batches(batch_size=BATCH):
 
         src, pos_dst, t, msg = batch.src, batch.dst, batch.t, batch.msg
+        if has_sequence_context:
+            seq_context = sequence_context_from_batch(batch)
+            if seq_context is not None:
+                seq_context.validate(src.size(0))
         unique_nodes = torch.cat([unique_nodes, src, pos_dst]).unique()
         total_edges += BATCH
 
@@ -165,6 +175,13 @@ if __name__ == "__main__":
 
     # Load data
     graph_4_3, graph_4_4, graph_4_5, graph_4_6, graph_4_7 = load_data()
+
+    has_context = all(sequence_context_available(graph) for graph in (graph_4_3, graph_4_4, graph_4_5, graph_4_6, graph_4_7))
+    if not has_context:
+        logger.warning(
+            "Sequence context tensors were missing from at least one inference graph. "
+            "Sequence branch scores will be skipped for those batches."
+        )
 
     # load trained model
     memory, gnn, link_pred, neighbor_loader = torch.load(f"{models_dir}/models.pt",map_location=device)

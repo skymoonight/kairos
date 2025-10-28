@@ -8,6 +8,10 @@ import logging
 from kairos_utils import *
 from config import *
 from model import *
+from sequence_context import (
+    sequence_context_available,
+    sequence_context_from_batch,
+)
 
 # Setting for logging
 logger = logging.getLogger("training_logger")
@@ -26,6 +30,8 @@ def train(train_data,
           optimizer,
           neighbor_loader
           ):
+    has_sequence_context = sequence_context_available(train_data)
+
     memory.train()
     gnn.train()
     link_pred.train()
@@ -38,6 +44,11 @@ def train(train_data,
         optimizer.zero_grad()
 
         src, pos_dst, t, msg = batch.src, batch.dst, batch.t, batch.msg
+
+        if has_sequence_context:
+            seq_context = sequence_context_from_batch(batch)
+            if seq_context is not None:
+                seq_context.validate(src.size(0))
 
         n_id = torch.cat([src, pos_dst]).unique()
         n_id, edge_index, e_id = neighbor_loader(n_id)
@@ -112,6 +123,13 @@ if __name__ == "__main__":
     # Initialize the models and the optimizer
     node_feat_size = train_data[0].msg.size(-1)
     memory, gnn, link_pred, optimizer, neighbor_loader = init_models(node_feat_size=node_feat_size)
+
+    has_context = all(sequence_context_available(graph) for graph in train_data)
+    if not has_context:
+        logger.warning(
+            "Sequence context tensors were not found in one or more training graphs. "
+            "The upcoming sequence branch will be disabled for those batches."
+        )
 
     # train the model
     for epoch in tqdm(range(1, epoch_num+1)):
